@@ -1,8 +1,12 @@
 <script lang="ts">
   import {
+    TEXT_FONT,
     TEXT_LINE_HEIGHT,
     bounds,
+    centerOf,
     moveAnn,
+    normAngle,
+    rotatePoint,
     uid,
     type Ann,
     type BoxAnn,
@@ -26,7 +30,9 @@
     stroke: number;
     fill: string | null;
     fillOpacity: number;
-    selectedId: string | null;
+    selectedIds: string[];
+    /** called when an action that changed annotations has finished */
+    oncommit: () => void;
   }
   let {
     anns,
@@ -39,15 +45,29 @@
     stroke,
     fill,
     fillOpacity,
-    selectedId = $bindable(),
+    selectedIds = $bindable(),
+    oncommit,
   }: Props = $props();
 
   let layer: HTMLDivElement;
   let editingId = $state<string | null>(null);
+  /** rubber-band selection rectangle while dragging on empty space */
+  let marquee = $state<{ x: number; y: number; w: number; h: number } | null>(null);
 
   type Drag =
-    | { mode: "move"; ann: Ann; last: [number, number]; moved: boolean }
-    | { mode: "resize"; ann: Resizable; start: [number, number]; w: number; h: number }
+    | { mode: "move"; anns: Ann[]; last: [number, number] }
+    | { mode: "marquee"; origin: [number, number]; base: string[] }
+    | { mode: "resize"; ann: Resizable; start: [number, number]; x: number; y: number; w: number; h: number }
+    | {
+        mode: "rotate";
+        ann: Ann;
+        center: [number, number];
+        /** pointer angle (radians) and object angle (degrees) when the drag began */
+        from: number;
+        angle: number;
+        /** original points of a freehand stroke, which is rotated by rewriting them */
+        points?: [number, number][];
+      }
     | { mode: "create"; ann: BoxAnn | ShapeAnn; origin: [number, number] }
     | { mode: "draw"; ann: DrawAnn };
   let drag: Drag | null = null;
@@ -73,8 +93,11 @@
   function remove(id: string) {
     const i = anns.findIndex((a) => a.id === id);
     if (i >= 0) anns.splice(i, 1);
-    if (selectedId === id) selectedId = null;
+    selectedIds = selectedIds.filter((s) => s !== id);
   }
+
+  /** Shift, ⌘ or Ctrl adds to / toggles the selection instead of replacing it. */
+  const additive = (e: PointerEvent) => e.shiftKey || e.metaKey || e.ctrlKey;
 
   /** Leave text editing, dropping the annotation if it ended up empty. */
   function stopEditing() {
@@ -82,6 +105,7 @@
     const a = find(editingId);
     editingId = null;
     if (a?.kind === "text" && !a.text.trim()) remove(a.id);
+    oncommit();
   }
 
   function onLayerDown(e: PointerEvent) {
@@ -92,7 +116,8 @@
       case "text": {
         const ann: TextAnn = { id: uid(), kind: "text", x: p[0], y: p[1] - (fontSize * TEXT_LINE_HEIGHT) / 2, text: "", size: fontSize, color };
         anns.push(ann);
-        selectedId = editingId = ann.id;
+        selectedIds = [ann.id];
+        editingId = ann.id;
         tool = "select";
         e.preventDefault(); // keep focus on the new editor
         return;
@@ -112,9 +137,12 @@
         drag = { mode: "draw", ann: anns[anns.length - 1] as DrawAnn };
         break;
       }
-      default:
-        selectedId = null;
-        return;
+      default: {
+        const base = additive(e) ? [...selectedIds] : [];
+        selectedIds = base;
+        drag = { mode: "marquee", origin: p, base };
+        break;
+      }
     }
     layer.setPointerCapture(e.pointerId);
   }
@@ -126,8 +154,15 @@
     e.preventDefault();
     stopEditing();
     tool = "select";
-    selectedId = ann.id;
-    drag = { mode: "move", ann, last: point(e), moved: false };
+    if (additive(e)) {
+      selectedIds = selectedIds.includes(ann.id)
+        ? selectedIds.filter((s) => s !== ann.id)
+        : [...selectedIds, ann.id];
+      return;
+    }
+    // Dragging an object that's part of the selection moves the whole group.
+    if (!selectedIds.includes(ann.id)) selectedIds = [ann.id];
+    drag = { mode: "move", anns: anns.filter((a) => selectedIds.includes(a.id)), last: point(e) };
     layer.setPointerCapture(e.pointerId);
   }
 
@@ -135,7 +170,23 @@
     if (!isResizable(ann)) return;
     e.stopPropagation();
     e.preventDefault();
-    drag = { mode: "resize", ann, start: point(e), w: ann.w, h: ann.h };
+    drag = { mode: "resize", ann, start: point(e), x: ann.x, y: ann.y, w: ann.w, h: ann.h };
+    layer.setPointerCapture(e.pointerId);
+  }
+
+  function onRotateDown(e: PointerEvent, ann: Ann) {
+    e.stopPropagation();
+    e.preventDefault();
+    const center = centerOf(ann);
+    const p = point(e);
+    drag = {
+      mode: "rotate",
+      ann,
+      center,
+      from: Math.atan2(p[1] - center[1], p[0] - center[0]),
+      angle: ann.kind === "draw" ? 0 : (ann.angle ?? 0),
+      points: ann.kind === "draw" ? ann.points.map(([x, y]) => [x, y]) : undefined,
+    };
     layer.setPointerCapture(e.pointerId);
   }
 
@@ -144,21 +195,44 @@
     const p = point(e);
     switch (drag.mode) {
       case "move": {
-        moveAnn(drag.ann, p[0] - drag.last[0], p[1] - drag.last[1]);
+        for (const a of drag.anns) moveAnn(a, p[0] - drag.last[0], p[1] - drag.last[1]);
         drag.last = p;
-        drag.moved = true;
+        break;
+      }
+      case "marquee": {
+        const [ox, oy] = drag.origin;
+        const m = { x: Math.min(ox, p[0]), y: Math.min(oy, p[1]), w: Math.abs(p[0] - ox), h: Math.abs(p[1] - oy) };
+        marquee = m;
+        const hit = anns
+          .filter((a) => {
+            const b = bounds(a);
+            return b.x <= m.x + m.w && b.x + b.w >= m.x && b.y <= m.y + m.h && b.y + b.h >= m.y;
+          })
+          .map((a) => a.id);
+        selectedIds = [...new Set([...drag.base, ...hit])];
         break;
       }
       case "resize": {
         const a = drag.ann;
-        const w = Math.max(8, drag.w + p[0] - drag.start[0]);
-        if (a.kind === "image") {
-          a.w = w;
-          a.h = (w * drag.h) / drag.w;
-        } else {
-          a.w = w;
-          a.h = Math.max(4, drag.h + p[1] - drag.start[1]);
-        }
+        const angle = a.angle ?? 0;
+        // Pointer movement in the object's own (unrotated) frame.
+        const [dx, dy] = rotatePoint([p[0] - drag.start[0], p[1] - drag.start[1]], [0, 0], -angle);
+        const w = Math.max(8, drag.w + dx);
+        const h = a.kind === "image" ? (w * drag.h) / drag.w : Math.max(4, drag.h + dy);
+        // Keep the (rotated) top-left corner where it is while the size changes.
+        const corner = rotatePoint([drag.x, drag.y], [drag.x + drag.w / 2, drag.y + drag.h / 2], angle);
+        const [cx, cy] = rotatePoint([corner[0] + w / 2, corner[1] + h / 2], corner, angle);
+        Object.assign(a, { w, h, x: cx - w / 2, y: cy - h / 2 });
+        break;
+      }
+      case "rotate": {
+        const center = drag.center;
+        const [cx, cy] = center;
+        let angle = drag.angle + ((Math.atan2(p[1] - cy, p[0] - cx) - drag.from) * 180) / Math.PI;
+        if (e.shiftKey) angle = Math.round(angle / 15) * 15; // snap to 15°
+        const a = drag.ann;
+        if (a.kind === "draw") a.points = drag.points!.map((pt) => rotatePoint(pt, center, angle));
+        else a.angle = normAngle(angle);
         break;
       }
       case "create": {
@@ -178,12 +252,17 @@
   }
 
   function onUp() {
-    if (drag?.mode === "create" && drag.ann.w < 3 && drag.ann.h < 3) remove(drag.ann.id);
+    if (!drag) return;
+    if (drag.mode === "create" && drag.ann.w < 3 && drag.ann.h < 3) remove(drag.ann.id);
     drag = null;
+    marquee = null;
+    oncommit();
   }
 
   function onDblClick(ann: Ann) {
-    if (ann.kind === "text") editingId = ann.id;
+    if (ann.kind !== "text") return;
+    selectedIds = [ann.id];
+    editingId = ann.id;
   }
 
   /** Make a text annotation editable in place; commits on input. */
@@ -240,7 +319,7 @@
 >
   {#each anns as ann (ann.id)}
     {@const b = bounds(ann)}
-    {@const selected = selectedId === ann.id}
+    {@const selected = selectedIds.includes(ann.id)}
     <div
       class="absolute {selected ? 'outline-2 outline-offset-2 outline-blue-500' : 'hover:outline-1 hover:outline-blue-300'}"
       style:left="{b.x * scale}px"
@@ -248,6 +327,7 @@
       style:width={ann.kind === "text" ? undefined : `${b.w * scale}px`}
       style:height={ann.kind === "text" ? undefined : `${b.h * scale}px`}
       style:cursor={tool === "select" ? (editingId === ann.id ? "text" : "move") : undefined}
+      style:transform={ann.kind !== "draw" && ann.angle ? `rotate(${ann.angle}deg)` : undefined}
       role="presentation"
       onpointerdown={(e) => onAnnDown(e, ann)}
       ondblclick={() => onDblClick(ann)}
@@ -261,7 +341,7 @@
             style:font-size="{ann.size * scale}px"
             style:line-height={TEXT_LINE_HEIGHT}
             style:color={ann.color}
-            style:font-family="Helvetica, Arial, sans-serif"
+            style:font-family={TEXT_FONT}
             onblur={() => onEditBlur(ann)}
           ></div>
         {:else}
@@ -270,7 +350,7 @@
             style:font-size="{ann.size * scale}px"
             style:line-height={TEXT_LINE_HEIGHT}
             style:color={ann.color}
-            style:font-family="Helvetica, Arial, sans-serif"
+            style:font-family={TEXT_FONT}
           >{ann.text}</div>
         {/if}
       {:else if ann.kind === "image"}
@@ -309,13 +389,34 @@
         </svg>
       {/if}
 
-      {#if selected && isResizable(ann)}
+      {#if selected && selectedIds.length === 1 && isResizable(ann)}
         <div
           class="absolute -right-2 -bottom-2 h-3.5 w-3.5 cursor-nwse-resize rounded-sm border-2 border-white bg-blue-500 shadow"
           role="presentation"
           onpointerdown={(e) => onResizeDown(e, ann)}
         ></div>
       {/if}
+
+      {#if selected && selectedIds.length === 1 && editingId !== ann.id}
+        <!-- rotate handle: a knob on a short stem above the top edge -->
+        <div class="pointer-events-none absolute -top-7 left-1/2 h-5 w-px -translate-x-1/2 bg-blue-500"></div>
+        <div
+          class="absolute -top-9 left-1/2 h-3.5 w-3.5 -translate-x-1/2 cursor-grab rounded-full border-2 border-blue-500 bg-white shadow active:cursor-grabbing"
+          title="Drag to rotate (Shift snaps to 15°)"
+          role="presentation"
+          onpointerdown={(e) => onRotateDown(e, ann)}
+        ></div>
+      {/if}
     </div>
   {/each}
+
+  {#if marquee}
+    <div
+      class="pointer-events-none absolute border border-dashed border-blue-500 bg-blue-500/10"
+      style:left="{marquee.x * scale}px"
+      style:top="{marquee.y * scale}px"
+      style:width="{marquee.w * scale}px"
+      style:height="{marquee.h * scale}px"
+    ></div>
+  {/if}
 </div>

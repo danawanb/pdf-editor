@@ -18,8 +18,13 @@ export async function displaySize(doc: PDFDocumentProxy, pageNumber: number, ext
   return { width: vp.width, height: vp.height };
 }
 
+/** Upper bound on canvas backing pixels; WebKit refuses very large canvases. */
+const MAX_CANVAS_PIXELS = 16_000_000;
+
 /**
  * Render a page into `canvas` so that it is `cssWidth` CSS pixels wide.
+ * Draws into an off-screen buffer first and swaps it in when done, so the old
+ * image stays visible (just stretched) while re-rendering at a new zoom.
  * Returns a cancel function.
  */
 export function renderPage(
@@ -36,14 +41,26 @@ export function renderPage(
     if (cancelled) return;
     const rotation = (page.rotate + extraRotation) % 360;
     const base = page.getViewport({ scale: 1, rotation });
-    const dpr = window.devicePixelRatio || 1;
-    const viewport = page.getViewport({ scale: (cssWidth / base.width) * dpr, rotation });
-    canvas.width = Math.floor(viewport.width);
-    canvas.height = Math.floor(viewport.height);
+    let scale = (cssWidth / base.width) * (window.devicePixelRatio || 1);
+    const pixels = base.width * base.height * scale * scale;
+    if (pixels > MAX_CANVAS_PIXELS) scale *= Math.sqrt(MAX_CANVAS_PIXELS / pixels);
+    const viewport = page.getViewport({ scale, rotation });
+
+    const buffer = document.createElement("canvas");
+    buffer.width = Math.floor(viewport.width);
+    buffer.height = Math.floor(viewport.height);
+    task = page.render({ canvas: buffer, viewport });
+    try {
+      await task.promise;
+    } catch {
+      return; // cancelled
+    }
+    if (cancelled) return;
+    canvas.width = buffer.width;
+    canvas.height = buffer.height;
+    canvas.getContext("2d")!.drawImage(buffer, 0, 0);
     canvas.style.width = `${cssWidth}px`;
     canvas.style.height = `${(cssWidth * base.height) / base.width}px`;
-    task = page.render({ canvas, viewport });
-    await task.promise.catch(() => {});
   })();
   return () => {
     cancelled = true;

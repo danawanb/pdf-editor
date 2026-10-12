@@ -50,6 +50,30 @@ function encodable(font: PDFFont, text: string): string {
   return [...text].map((c) => (supported.has(c.codePointAt(0)!) ? c : "?")).join("");
 }
 
+/**
+ * Rotate everything drawn after this call clockwise (as seen on screen) by
+ * `deg` around `(cx, cy)`, given in display space with y up.
+ */
+function enterRotation(page: PDFPage, deg: number, cx: number, cy: number) {
+  const r = (-deg * Math.PI) / 180; // clockwise on screen = negative angle with y up
+  const cos = Math.cos(r);
+  const sin = Math.sin(r);
+  page.pushOperators(
+    pushGraphicsState(),
+    concatTransformationMatrix(cos, sin, -sin, cos, cx - cos * cx + sin * cy, cy - sin * cx - cos * cy),
+  );
+}
+
+/** Centre of an annotation's box in display space (y down), using the PDF font's metrics for text. */
+function center(a: Exclude<Ann, { kind: "draw" }>, font: PDFFont): [number, number] {
+  if (a.kind === "text") {
+    const lines = a.text.split("\n");
+    const w = Math.max(0, ...lines.map((l) => font.widthOfTextAtSize(encodable(font, l), a.size)));
+    return [a.x + w / 2, a.y + (lines.length * a.size * TEXT_LINE_HEIGHT) / 2];
+  }
+  return [a.x + a.w / 2, a.y + a.h / 2];
+}
+
 /** Draw `annsPerPage[i]` onto page i of `pdfBytes` and return the new bytes. */
 export async function applyAnnotations(pdfBytes: Uint8Array, annsPerPage: Ann[][]): Promise<Uint8Array> {
   const pdf = await PDFDocument.load(pdfBytes);
@@ -63,6 +87,11 @@ export async function applyAnnotations(pdfBytes: Uint8Array, annsPerPage: Ann[][
     const H = enterDisplaySpace(page);
 
     for (const a of anns) {
+      const angle = a.kind === "draw" ? 0 : (a.angle ?? 0);
+      if (angle) {
+        const [cx, cy] = center(a as Exclude<Ann, { kind: "draw" }>, font);
+        enterRotation(page, angle, cx, H - cy);
+      }
       switch (a.kind) {
         case "text": {
           a.text.split("\n").forEach((line, li) => {
@@ -133,6 +162,7 @@ export async function applyAnnotations(pdfBytes: Uint8Array, annsPerPage: Ann[][
           break;
         }
       }
+      if (angle) page.pushOperators(popGraphicsState());
     }
     page.pushOperators(popGraphicsState());
   }

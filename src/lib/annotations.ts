@@ -22,7 +22,16 @@ interface Base {
   id: string;
 }
 
-export interface TextAnn extends Base {
+/**
+ * Objects with a box can be rotated around the box centre. Freehand strokes
+ * have their rotation applied to the points directly instead.
+ */
+interface Rotatable {
+  /** clockwise rotation in degrees, 0–360 (absent = 0) */
+  angle?: number;
+}
+
+export interface TextAnn extends Base, Rotatable {
   kind: "text";
   x: number;
   y: number;
@@ -31,7 +40,7 @@ export interface TextAnn extends Base {
   color: string;
 }
 
-export interface ImageAnn extends Base {
+export interface ImageAnn extends Base, Rotatable {
   kind: "image";
   x: number;
   y: number;
@@ -41,7 +50,7 @@ export interface ImageAnn extends Base {
   src: string;
 }
 
-export interface BoxAnn extends Base {
+export interface BoxAnn extends Base, Rotatable {
   kind: "highlight";
   x: number;
   y: number;
@@ -51,7 +60,7 @@ export interface BoxAnn extends Base {
 }
 
 /** Rectangle, ellipse or triangle (apex at the top) inside its bounding box. */
-export interface ShapeAnn extends Base {
+export interface ShapeAnn extends Base, Rotatable {
   kind: ShapeKind;
   x: number;
   y: number;
@@ -145,8 +154,48 @@ export function bounds(a: Ann): { x: number; y: number; w: number; h: number } {
   }
   if (a.kind === "text") {
     const lines = a.text.split("\n");
-    const longest = Math.max(1, ...lines.map((l) => l.length));
-    return { x: a.x, y: a.y, w: longest * a.size * 0.55, h: lines.length * a.size * TEXT_LINE_HEIGHT };
+    const w = Math.max(a.size * 0.5, ...lines.map((l) => textWidth(l, a.size)));
+    return { x: a.x, y: a.y, w, h: lines.length * a.size * TEXT_LINE_HEIGHT };
   }
   return { x: a.x, y: a.y, w: a.w, h: a.h };
+}
+
+export const TEXT_FONT = "Helvetica, Arial, sans-serif";
+let measureCtx: CanvasRenderingContext2D | null | undefined;
+
+/** Width in points of one line of text, as the editor renders it. */
+export function textWidth(line: string, size: number): number {
+  if (measureCtx === undefined) {
+    measureCtx = typeof document === "undefined" ? null : document.createElement("canvas").getContext("2d");
+  }
+  if (!measureCtx) return line.length * size * 0.55;
+  measureCtx.font = `${size}px ${TEXT_FONT}`;
+  return measureCtx.measureText(line).width;
+}
+
+export const normAngle = (deg: number) => ((Math.round(deg * 10) / 10) % 360 + 360) % 360;
+
+/** Rotate `[x, y]` clockwise (on screen, y down) by `deg` around `c`. */
+export function rotatePoint([x, y]: [number, number], c: [number, number], deg: number): [number, number] {
+  const r = (deg * Math.PI) / 180;
+  const cos = Math.cos(r);
+  const sin = Math.sin(r);
+  const dx = x - c[0];
+  const dy = y - c[1];
+  return [c[0] + dx * cos - dy * sin, c[1] + dx * sin + dy * cos];
+}
+
+export const centerOf = (a: Ann): [number, number] => {
+  const b = bounds(a);
+  return [b.x + b.w / 2, b.y + b.h / 2];
+};
+
+/** Rotate an annotation clockwise by `deg` around its own centre. */
+export function rotateAnnBy(a: Ann, deg: number): void {
+  if (a.kind === "draw") {
+    const c = centerOf(a);
+    a.points = a.points.map((p) => rotatePoint(p, c, deg));
+  } else {
+    a.angle = normAngle((a.angle ?? 0) + deg);
+  }
 }
