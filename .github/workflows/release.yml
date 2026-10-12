@@ -47,7 +47,7 @@ jobs:
               body: [
                 "## Downloads",
                 "- **macOS** (Apple Silicon & Intel): `PDF.Editor_*_universal.dmg`",
-                "- **Windows**: `PDF.Editor_*_x64-setup.exe` (or the `.msi`)",
+                "- **Windows**: `PDF.Editor_*_x64-setup.exe`",
                 "",
                 "macOS builds are not notarized: on first launch, right-click the app → **Open**.",
               ].join("\n"),
@@ -62,11 +62,12 @@ jobs:
       fail-fast: false
       matrix:
         include:
+          # One installer per OS: a universal .dmg and a setup .exe.
           - platform: macos-latest
-            args: --target universal-apple-darwin
+            args: --target universal-apple-darwin --bundles dmg
             rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
           - platform: windows-latest
-            args: ""
+            args: --bundles nsis
             rust-targets: ""
     runs-on: ${{ matrix.platform }}
     steps:

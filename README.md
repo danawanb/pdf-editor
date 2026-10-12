@@ -31,7 +31,7 @@ npm run tauri build          # macOS: .app + .dmg in src-tauri/target/release/bu
 
 ## CI/CD
 - **CI** (`.github/workflows/ci.yml`): on every push to `main` and every PR, runs type-checks, the frontend build and Rust tests on macOS and Windows runners.
-- **Release** (`.github/workflows/release.yml`): builds a universal macOS `.dmg` (Apple Silicon + Intel) and Windows `.msi`/`-setup.exe`, then publishes them as a GitHub Release.
+- **Release** (`.github/workflows/release.yml`): builds one installer per OS, a universal macOS `.dmg` (Apple Silicon + Intel) and a Windows `-setup.exe`, then publishes them as a GitHub Release.
 
 To cut a release:
 1. Bump `version` in `src-tauri/tauri.conf.json` (and `package.json`), e.g. `0.2.0`, and commit.
