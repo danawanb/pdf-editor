@@ -1,0 +1,110 @@
+name: Release
+
+# Push a tag like v0.2.0 to build macOS + Windows installers and publish them
+# as a GitHub Release. The tag must match "version" in src-tauri/tauri.conf.json.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to release (e.g. v0.2.0)
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  TAG: ${{ inputs.tag || github.ref_name }}
+
+jobs:
+  create-release:
+    runs-on: ubuntu-latest
+    outputs:
+      release_id: ${{ steps.release.outputs.result }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - name: Check tag matches app version
+        run: |
+          VERSION=$(jq -r .version src-tauri/tauri.conf.json)
+          if [ "v$VERSION" != "$TAG" ]; then
+            echo "::error::Tag $TAG does not match tauri.conf.json version v$VERSION"
+            exit 1
+          fi
+      - name: Create draft release
+        id: release
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const tag = process.env.TAG;
+            const { data } = await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: tag,
+              name: `PDF Editor ${tag}`,
+              body: [
+                "## Downloads",
+                "- **macOS** (Apple Silicon & Intel): `PDF.Editor_*_universal.dmg`",
+                "- **Windows**: `PDF.Editor_*_x64-setup.exe` (or the `.msi`)",
+                "",
+                "macOS builds are not notarized: on first launch, right-click the app → **Open**.",
+              ].join("\n"),
+              draft: true,
+              generate_release_notes: true,
+            });
+            return data.id;
+
+  build:
+    needs: create-release
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: --target universal-apple-darwin
+            rust-targets: aarch64-apple-darwin,x86_64-apple-darwin
+          - platform: windows-latest
+            args: ""
+            rust-targets: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.TAG }}
+      - uses: actions/setup-node@v4
+        with:
+          node-version: lts/*
+          cache: npm
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.rust-targets }}
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+      - run: npm ci
+      - run: cargo test --manifest-path src-tauri/Cargo.toml --lib
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          releaseId: ${{ needs.create-release.outputs.release_id }}
+          args: ${{ matrix.args }}
+
+  publish-release:
+    needs: [create-release, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Publish release
+        uses: actions/github-script@v7
+        env:
+          RELEASE_ID: ${{ needs.create-release.outputs.release_id }}
+        with:
+          script: |
+            await github.rest.repos.updateRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              release_id: Number(process.env.RELEASE_ID),
+              draft: false,
+            });
